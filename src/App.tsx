@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import type {
   Order,
   MenuItem,
@@ -7,7 +7,8 @@ import type {
   StatusFilterType,
   DraftOrder,
   CashSummary,
-  KitchenPrepBatch
+  KitchenPrepBatch,
+  AuthState
 } from './types';
 import {
   getRelativeDateStr,
@@ -25,6 +26,9 @@ import {
   generatePaymentReminder,
   generateRiderDetails
 } from './utils/receiptGenerator';
+import { localDb, seedInitialDataIfEmpty, queueMutation } from './db';
+import { useSyncWorker } from './hooks/useSyncWorker';
+import { apiClient } from './services/apiClient';
 
 import { Toast } from './components/common/Toast';
 import { Header } from './components/header/Header';
@@ -34,6 +38,7 @@ import { MenuManager } from './components/menu/MenuManager';
 import { IntakeDrawer } from './components/modals/IntakeDrawer';
 import { PaymentModal } from './components/modals/PaymentModal';
 import { DailyTallySheet } from './components/modals/DailyTallySheet';
+import { AuthModal } from './components/modals/AuthModal';
 import { BottomNav } from './components/navigation/BottomNav';
 import { FloatingIntakeButton } from './components/navigation/FloatingIntakeButton';
 
@@ -41,25 +46,29 @@ export default function App() {
   const todayStr = getRelativeDateStr(0);
   const tomorrowStr = getRelativeDateStr(1);
 
-  // Persistent State: Orders
-  const [orders, setOrders] = useState<Order[]>(() => {
+  // Authentication State
+  const [authState, setAuthState] = useState<AuthState>(() => {
     try {
-      const saved = localStorage.getItem('bakeflow_mobile_orders_v2');
-      return saved ? JSON.parse(saved) : getInitialOrders();
+      const token = localStorage.getItem('bakeflow_auth_token');
+      const user = localStorage.getItem('bakeflow_auth_user');
+      const seller = localStorage.getItem('bakeflow_auth_seller');
+      return {
+        token,
+        user: user ? JSON.parse(user) : null,
+        seller: seller ? JSON.parse(seller) : null,
+        isGuest: !token
+      };
     } catch {
-      return getInitialOrders();
+      return { token: null, user: null, seller: null, isGuest: true };
     }
   });
 
-  // Persistent State: Menu Catalog (with dailyCap)
-  const [menuItems, setMenuItems] = useState<MenuItem[]>(() => {
-    try {
-      const saved = localStorage.getItem('bakeflow_mobile_menu_v2');
-      return saved ? JSON.parse(saved) : DEFAULT_MENU_ITEMS;
-    } catch {
-      return DEFAULT_MENU_ITEMS;
-    }
-  });
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
+
+  // Persistent State: Orders & Menu (Hydrated from Dexie.js IndexedDB)
+  const [orders, setOrders] = useState<Order[]>([]);
+  const [menuItems, setMenuItems] = useState<MenuItem[]>([]);
+  const [isDbLoaded, setIsDbLoaded] = useState(false);
 
   // Persistent State: Kitchen Prep Check-Offs
   const [checkedPrepKeys, setCheckedPrepKeys] = useState<Record<string, boolean>>(() => {
@@ -71,21 +80,28 @@ export default function App() {
     }
   });
 
-  useEffect(() => {
+  // Reload data from Dexie.js
+  const reloadDataFromDexie = useCallback(async () => {
     try {
-      localStorage.setItem('bakeflow_mobile_orders_v2', JSON.stringify(orders));
-    } catch (e) {
-      console.error(e);
+      await seedInitialDataIfEmpty();
+      const [allOrders, allMenu] = await Promise.all([
+        localDb.orders.toArray(),
+        localDb.menu_items.toArray()
+      ]);
+      setOrders(allOrders.filter((o) => !o.deleted_at));
+      setMenuItems(allMenu.filter((m) => !m.deleted_at && m.is_active !== false));
+      setIsDbLoaded(true);
+    } catch (err) {
+      console.error('Dexie load error, fallback to defaults:', err);
+      setOrders(getInitialOrders());
+      setMenuItems(DEFAULT_MENU_ITEMS);
+      setIsDbLoaded(true);
     }
-  }, [orders]);
+  }, []);
 
   useEffect(() => {
-    try {
-      localStorage.setItem('bakeflow_mobile_menu_v2', JSON.stringify(menuItems));
-    } catch (e) {
-      console.error(e);
-    }
-  }, [menuItems]);
+    reloadDataFromDexie();
+  }, [reloadDataFromDexie]);
 
   useEffect(() => {
     try {
@@ -94,6 +110,12 @@ export default function App() {
       console.error(e);
     }
   }, [checkedPrepKeys]);
+
+  // Background Delta Sync Engine Hook
+  const { syncStatus, pendingCount, triggerSync, refreshPendingCount } = useSyncWorker({
+    authToken: authState.token,
+    onRemoteChangesLoaded: reloadDataFromDexie
+  });
 
   // Navigation & Filter States
   const [activeTab, setActiveTab] = useState<ActiveTabType>('orders');
@@ -143,6 +165,29 @@ export default function App() {
       showToast(toastText);
       setTimeout(() => setCopiedFeedback(null), 2200);
     });
+  };
+
+  // Auth Handlers
+  const handleAuthSuccess = (token: string, user: any, seller: any) => {
+    localStorage.setItem('bakeflow_auth_token', token);
+    localStorage.setItem('bakeflow_auth_user', JSON.stringify(user));
+    localStorage.setItem('bakeflow_auth_seller', JSON.stringify(seller));
+    setAuthState({ token, user, seller, isGuest: false });
+    showToast(`Logged in to ${seller.shop_name}!`);
+    setTimeout(() => triggerSync(), 200);
+  };
+
+  const handleLogout = async () => {
+    if (authState.token) {
+      await apiClient.logout(authState.token);
+    }
+    localStorage.removeItem('bakeflow_auth_token');
+    localStorage.removeItem('bakeflow_auth_user');
+    localStorage.removeItem('bakeflow_auth_seller');
+    localStorage.removeItem('bakeflow_last_synced_at');
+    setAuthState({ token: null, user: null, seller: null, isGuest: true });
+    setIsAuthModalOpen(false);
+    showToast('Logged out. Switched to offline local mode.');
   };
 
   // ==========================================================================
@@ -302,7 +347,7 @@ export default function App() {
   }, [draftOrder.customer_name, draftOrder.due_date, orders, targetDateStr, dismissedAppendOrderId]);
 
   // ==========================================================================
-  // HANDLERS
+  // HANDLERS (DEXIE + BACKGROUND DELTA SYNC QUEUE)
   // ==========================================================================
 
   const openIntakeDrawer = () => {
@@ -455,59 +500,63 @@ export default function App() {
     return warnings;
   }, [draftOrder.items, menuItems, bookedQtyDraftDate]);
 
-  const handleAppendToExistingOrder = () => {
+  const handleAppendToExistingOrder = async () => {
     if (!matchingExistingOrder) return;
     if (draftOrder.items.length === 0) {
       showToast('Add at least 1 item to append.');
       return;
     }
 
-    setOrders((prev) =>
-      prev.map((ord) => {
-        if (ord.id !== matchingExistingOrder.id) return ord;
-
-        const mergedItems = [...ord.items];
-        draftOrder.items.forEach((newItem) => {
-          const existingIdx = mergedItems.findIndex(
-            (i) => i.item_name === newItem.item_name && (i.notes || '') === (newItem.notes || '')
-          );
-          if (existingIdx > -1) {
-            mergedItems[existingIdx] = {
-              ...mergedItems[existingIdx],
-              quantity: mergedItems[existingIdx].quantity + newItem.quantity
-            };
-          } else {
-            mergedItems.push({ ...newItem, id: generateId() });
-          }
-        });
-
-        const updatedTotal = mergedItems.reduce((s, i) => s + i.quantity * i.unit_price, 0);
-        const updatedPaid = ord.amount_paid + (Number(draftOrder.amount_paid) || 0);
-        const cappedPaid = Math.min(updatedTotal, updatedPaid);
-        const updatedPaymentStatus =
-          cappedPaid >= updatedTotal ? 'paid' : cappedPaid > 0 ? 'partial' : 'unpaid';
-
-        return {
-          ...ord,
-          items: mergedItems,
-          total_amount: updatedTotal,
-          amount_paid: cappedPaid,
-          payment_status: updatedPaymentStatus,
-          raw_chat_snippet: [ord.raw_chat_snippet, chatInput.trim()].filter(Boolean).join('\n+ ')
+    const mergedItems = [...matchingExistingOrder.items];
+    draftOrder.items.forEach((newItem) => {
+      const existingIdx = mergedItems.findIndex(
+        (i) => i.item_name === newItem.item_name && (i.notes || '') === (newItem.notes || '')
+      );
+      if (existingIdx > -1) {
+        mergedItems[existingIdx] = {
+          ...mergedItems[existingIdx],
+          quantity: mergedItems[existingIdx].quantity + newItem.quantity
         };
-      })
-    );
+      } else {
+        mergedItems.push({ ...newItem, id: generateId() });
+      }
+    });
+
+    const updatedTotal = mergedItems.reduce((s, i) => s + i.quantity * i.unit_price, 0);
+    const updatedPaid = matchingExistingOrder.amount_paid + (Number(draftOrder.amount_paid) || 0);
+    const cappedPaid = Math.min(updatedTotal, updatedPaid);
+    const updatedPaymentStatus =
+      cappedPaid >= updatedTotal ? 'paid' : cappedPaid > 0 ? 'partial' : 'unpaid';
+
+    const updatedOrder: Order = {
+      ...matchingExistingOrder,
+      items: mergedItems,
+      total_amount: updatedTotal,
+      amount_paid: cappedPaid,
+      payment_status: updatedPaymentStatus,
+      raw_chat_snippet: [matchingExistingOrder.raw_chat_snippet, chatInput.trim()].filter(Boolean).join('\n+ '),
+      updated_at: new Date().toISOString()
+    };
+
+    // 1. Save to local Dexie
+    await localDb.orders.put(updatedOrder);
+    setOrders((prev) => prev.map((o) => (o.id === updatedOrder.id ? updatedOrder : o)));
+
+    // 2. Queue mutation & trigger sync
+    await queueMutation('orders', 'upsert', updatedOrder, !!authState.token);
+    refreshPendingCount();
+    triggerSync();
 
     if (matchingExistingOrder.due_date === tomorrowStr) setDateFilter('tomorrow');
     else setDateFilter('today');
 
     setActiveTab('orders');
     setIsIntakeSheetOpen(false);
-    showToast(`Added items to ${matchingExistingOrder.order_code} (${matchingExistingOrder.customer_name})!`);
+    showToast(`Added items to ${matchingExistingOrder.order_code}!`);
     resetDraftState();
   };
 
-  const handleSaveDraftOrder = (e: React.FormEvent) => {
+  const handleSaveDraftOrder = async (e: React.FormEvent) => {
     e.preventDefault();
     if (draftOrder.items.length === 0) {
       showToast('Tap at least 1 item to add.');
@@ -544,10 +593,18 @@ export default function App() {
       total_amount: finalTotal,
       order_status: 'pending',
       raw_chat_snippet: chatInput.trim(),
-      items: draftOrder.items
+      items: draftOrder.items,
+      updated_at: new Date().toISOString()
     };
 
+    // 1. Instant local write to Dexie
+    await localDb.orders.put(newOrder);
     setOrders((prev) => [newOrder, ...prev]);
+
+    // 2. Queue mutation for background sync
+    await queueMutation('orders', 'upsert', newOrder, !!authState.token);
+    refreshPendingCount();
+    triggerSync();
 
     if (newOrder.due_date === tomorrowStr) {
       setDateFilter('tomorrow');
@@ -561,66 +618,91 @@ export default function App() {
     showToast(`Saved ${newOrder.order_code} (${newOrder.customer_name})`);
   };
 
-  const handleApplyPaymentUpdate = (
+  const handleApplyPaymentUpdate = async (
     orderId: string,
     mode: 'paid' | 'unpaid' | 'partial',
     dpAmount?: number,
     method?: string
   ) => {
-    setOrders((prev) =>
-      prev.map((order) => {
-        if (order.id !== orderId) return order;
+    const existing = orders.find((o) => o.id === orderId);
+    if (!existing) return;
 
-        if (mode === 'paid') {
-          showToast(`${order.order_code} marked PAID`);
-          return {
-            ...order,
-            payment_status: 'paid',
-            payment_method: method || order.payment_method,
-            amount_paid: order.total_amount
-          };
-        }
+    let updatedStatus = existing.payment_status;
+    let updatedPaid = existing.amount_paid;
 
-        if (mode === 'unpaid') {
-          showToast(`${order.order_code} reset to UNPAID`);
-          return {
-            ...order,
-            payment_status: 'unpaid',
-            payment_method: method || order.payment_method,
-            amount_paid: 0
-          };
-        }
+    if (mode === 'paid') {
+      updatedStatus = 'paid';
+      updatedPaid = existing.total_amount;
+      showToast(`${existing.order_code} marked PAID`);
+    } else if (mode === 'unpaid') {
+      updatedStatus = 'unpaid';
+      updatedPaid = 0;
+      showToast(`${existing.order_code} reset to UNPAID`);
+    } else {
+      updatedPaid = Math.max(0, Math.min(existing.total_amount, dpAmount || 0));
+      updatedStatus =
+        updatedPaid >= existing.total_amount ? 'paid' : updatedPaid > 0 ? 'partial' : 'unpaid';
+      showToast(`Updated payment for ${existing.order_code}`);
+    }
 
-        // partial
-        const parsed = Math.max(0, Math.min(order.total_amount, dpAmount || 0));
-        const status =
-          parsed >= order.total_amount ? 'paid' : parsed > 0 ? 'partial' : 'unpaid';
-        showToast(`Updated payment for ${order.order_code}`);
-        return {
-          ...order,
-          payment_status: status,
-          payment_method: method || order.payment_method,
-          amount_paid: parsed
-        };
-      })
-    );
+    const updatedOrder: Order = {
+      ...existing,
+      payment_status: updatedStatus,
+      payment_method: method || existing.payment_method,
+      amount_paid: updatedPaid,
+      updated_at: new Date().toISOString()
+    };
+
+    // 1. Instant local update
+    await localDb.orders.put(updatedOrder);
+    setOrders((prev) => prev.map((o) => (o.id === orderId ? updatedOrder : o)));
+
+    // 2. Log sync queue mutation
+    await queueMutation('orders', 'upsert', updatedOrder, !!authState.token);
+    refreshPendingCount();
+    triggerSync();
+
     setPaymentModalOrder(null);
   };
 
-  const advanceOrderStatus = (orderId: string) => {
+  const advanceOrderStatus = async (orderId: string) => {
+    const existing = orders.find((o) => o.id === orderId);
+    if (!existing) return;
+
     const flow: Order['order_status'][] = ['pending', 'prepping', 'ready', 'completed'];
-    setOrders((prev) =>
-      prev.map((order) => {
-        if (order.id !== orderId) return order;
-        const idx = flow.indexOf(order.order_status);
-        const nextStatus = idx >= 0 && idx < flow.length - 1 ? flow[idx + 1] : 'pending';
-        return { ...order, order_status: nextStatus };
-      })
-    );
+    const idx = flow.indexOf(existing.order_status);
+    const nextStatus = idx >= 0 && idx < flow.length - 1 ? flow[idx + 1] : 'pending';
+
+    const updatedOrder: Order = {
+      ...existing,
+      order_status: nextStatus,
+      updated_at: new Date().toISOString()
+    };
+
+    await localDb.orders.put(updatedOrder);
+    setOrders((prev) => prev.map((o) => (o.id === orderId ? updatedOrder : o)));
+
+    await queueMutation('orders', 'upsert', updatedOrder, !!authState.token);
+    refreshPendingCount();
+    triggerSync();
   };
 
-  const deleteOrder = (orderId: string) => {
+  const deleteOrder = async (orderId: string) => {
+    const existing = orders.find((o) => o.id === orderId);
+    if (!existing) return;
+
+    const deletedRecord: Order = {
+      ...existing,
+      deleted_at: new Date().toISOString()
+    };
+
+    await localDb.orders.delete(orderId);
     setOrders((prev) => prev.filter((o) => o.id !== orderId));
+
+    await queueMutation('orders', 'delete', deletedRecord, !!authState.token);
+    refreshPendingCount();
+    triggerSync();
+
     showToast('Order deleted.');
   };
 
@@ -632,15 +714,29 @@ export default function App() {
     }));
   };
 
-  const handleResetDemo = () => {
-    setOrders(getInitialOrders());
-    setMenuItems(DEFAULT_MENU_ITEMS);
+  const handleResetDemo = async () => {
+    await localDb.orders.clear();
+    await localDb.menu_items.clear();
+    await localDb.sync_queue.clear();
+    await seedInitialDataIfEmpty();
+    await reloadDataFromDexie();
     setCheckedPrepKeys({});
     setDateFilter('today');
     setStatusFilter('all');
     setActiveTab('orders');
-    showToast('Demo data reset!');
+    showToast('Demo data reset in IndexedDB!');
   };
+
+  if (!isDbLoaded) {
+    return (
+      <div className="min-h-screen bg-stone-100 flex items-center justify-center font-sans text-stone-900">
+        <div className="text-center space-y-2">
+          <div className="w-10 h-10 border-4 border-amber-500 border-t-transparent rounded-full animate-spin mx-auto" />
+          <p className="text-xs font-extrabold text-stone-600">Loading BakeFlow Database...</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-stone-200/80 flex justify-center font-sans text-stone-900 selection:bg-amber-200">
@@ -648,13 +744,17 @@ export default function App() {
         {/* Floating Toast Notification */}
         <Toast message={toastMessage} />
 
-        {/* 1. Header & Quick Glanceable Metrics */}
+        {/* 1. Header & Quick Glanceable Metrics + Cloud Sync Badge */}
         <Header
           dateFilter={dateFilter}
           setDateFilter={setDateFilter}
           todayOrderCount={todayOrderCount}
           tomorrowOrderCount={tomorrowOrderCount}
           cashSummary={cashSummary}
+          authState={authState}
+          syncStatus={syncStatus}
+          pendingCount={pendingCount}
+          onOpenAuth={() => setIsAuthModalOpen(true)}
           onResetDemo={handleResetDemo}
           onOpenTally={() => setIsTallySheetOpen(true)}
         />
@@ -796,6 +896,21 @@ export default function App() {
             URL.revokeObjectURL(url);
             showToast('Downloaded JSON backup!');
           }}
+        />
+
+        {/* 8. Shop Account & Cloud Sync Modal */}
+        <AuthModal
+          isOpen={isAuthModalOpen}
+          onClose={() => setIsAuthModalOpen(false)}
+          authState={authState}
+          onAuthSuccess={handleAuthSuccess}
+          onLogout={handleLogout}
+          onContinueGuest={() => {
+            setAuthState((prev) => ({ ...prev, isGuest: true }));
+            showToast('Using local offline mode.');
+          }}
+          onTriggerSync={triggerSync}
+          isSyncing={syncStatus === 'syncing'}
         />
       </div>
     </div>
