@@ -1,0 +1,22 @@
+<?php
+
+use App\Http\Controllers\Api\AuthController;
+use App\Http\Controllers\Api\SyncController;
+use Illuminate\Support\Facades\Route;
+
+// Public Authentication
+Route::prefix('auth')->group(function () {
+    Route::post('/register', [AuthController::class, 'register']);
+    Route::post('/login', [AuthController::class, 'login']);
+});
+
+// Protected Tenant & Sync Routes
+Route::middleware('auth:sanctum')->group(function () {
+    Route::prefix('auth')->group(function () {
+        Route::get('/me', [AuthController::class, 'me']);
+        Route::post('/logout', [AuthController::class, 'logout']);
+    });
+
+    // Bidirectional Delta Sync Endpoint
+    Route::post('/sync', [SyncController::class, 'sync']);
+});
